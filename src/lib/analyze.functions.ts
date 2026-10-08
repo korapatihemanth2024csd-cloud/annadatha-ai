@@ -9,13 +9,27 @@ const Input = z.object({
   lang: z.enum(["en", "ta", "hi", "te"]).optional().default("en"),
 });
 
-const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
-const DEFAULT_OPENROUTER_MODEL = "google/gemma-3-27b-it:free";
+const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
+const GEMINI_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash"];
+
+const DEFAULT_OPENROUTER_MODEL = "google/gemini-2.5-flash";
+const OPENROUTER_FALLBACK_MODELS = [
+  "google/gemini-2.5-flash",
+  "google/gemini-2.5-flash-lite",
+  "openai/gpt-4o-mini",
+  "qwen/qwen-2.5-vl-72b-instruct",
+  "qwen/qwen2.5-vl-72b-instruct",
+  "google/gemini-2.5-pro",
+  "openai/gpt-4o",
+  "openrouter/free",
+];
 
 const BANNED_MODELS = new Set([
   "gemini-1.0-pro-vision",
   "gemini-1.0-pro-vision-latest",
   "gemini-pro-vision",
+  "gemini-1.5-flash",
+  "gemini-2.0-flash",
 ]);
 
 function buildPrompt(d: Record<string, string>, lang: string = "en"): string {
@@ -312,11 +326,10 @@ export async function analyzeWithGemini(
     throw new Error("Gemini API key unavailable");
   }
 
-  const modelName = (getEnv("GEMINI_MODEL") ?? DEFAULT_GEMINI_MODEL).trim();
-  if (BANNED_MODELS.has(modelName)) {
-    console.error(`[Gemini Error] Banned deprecated model configured: ${modelName}`);
-    throw new Error(`Deprecated Gemini model: ${modelName}`);
-  }
+  const configuredModel = (getEnv("GEMINI_MODEL") ?? DEFAULT_GEMINI_MODEL).trim();
+  const candidateModels = Array.from(new Set([configuredModel, ...GEMINI_FALLBACK_MODELS])).filter(
+    (m) => !BANNED_MODELS.has(m)
+  );
 
   const prompt = buildPrompt(details, lang);
   const firstImage = images[0]!;
@@ -339,13 +352,13 @@ export async function analyzeWithGemini(
     },
   };
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiKey}`;
+  let lastError: Error | null = null;
 
-  const maxRetries = 2;
-  const backoffDelays = [2000, 5000];
+  for (const modelName of candidateModels) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiKey}`;
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
+      console.log(`[Gemini] Attempting analysis with model: ${modelName}`);
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -354,16 +367,10 @@ export async function analyzeWithGemini(
 
       if (!res.ok) {
         const status = res.status;
-        console.error(`[Gemini Error] Attempt ${attempt + 1} returned HTTP ${status}`);
-
-        // Immediate failure for 400, 401, 403, 404 (no retries)
-        const isTemporary = [503, 429, 500, 502, 504].includes(status);
-        if (isTemporary && attempt < maxRetries) {
-          await new Promise((r) => setTimeout(r, backoffDelays[attempt]));
-          continue;
-        }
-
-        throw new Error(`Gemini HTTP failure status ${status}`);
+        const errText = await res.text().catch(() => "");
+        console.warn(`[Gemini Warn] Model ${modelName} returned HTTP ${status}: ${errText.slice(0, 150)}`);
+        lastError = new Error(`Gemini ${modelName} HTTP status ${status}`);
+        continue; // Try next fallback model
       }
 
       const json = (await res.json()) as {
@@ -371,8 +378,9 @@ export async function analyzeWithGemini(
       };
       let text = json.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
       if (!text) {
-        console.error(`[Gemini Error] Empty candidate content returned on attempt ${attempt + 1}`);
-        throw new Error("Gemini returned empty text response");
+        console.warn(`[Gemini Warn] Empty candidate content from model ${modelName}`);
+        lastError = new Error(`Gemini ${modelName} empty response`);
+        continue;
       }
 
       text = text
@@ -383,19 +391,15 @@ export async function analyzeWithGemini(
 
       const parsed = JSON.parse(text);
       const validated = validateAIResponse(parsed);
+      console.log(`[Gemini] Successfully analyzed with model: ${modelName}`);
       return { ...validated, provider: "Gemini AI" };
     } catch (err) {
-      console.error(`[Gemini Error] Attempt ${attempt + 1} exception:`, err instanceof Error ? err.message : String(err));
-      const isNetworkErr = err instanceof TypeError || (err instanceof Error && err.message.includes("fetch"));
-      if (isNetworkErr && attempt < maxRetries) {
-        await new Promise((r) => setTimeout(r, backoffDelays[attempt]));
-        continue;
-      }
-      throw err;
+      console.warn(`[Gemini Warn] Model ${modelName} failed:`, err instanceof Error ? err.message : String(err));
+      lastError = err instanceof Error ? err : new Error(String(err));
     }
   }
 
-  throw new Error("Gemini failed after retries");
+  throw lastError ?? new Error("All Gemini models failed");
 }
 
 export async function analyzeWithOpenRouter(
@@ -413,29 +417,30 @@ export async function analyzeWithOpenRouter(
     throw new Error("OpenRouter API key unavailable");
   }
 
-  const modelName = (getEnv("OPENROUTER_MODEL") ?? DEFAULT_OPENROUTER_MODEL).trim();
+  const configuredModel = (getEnv("OPENROUTER_MODEL") ?? DEFAULT_OPENROUTER_MODEL).trim();
+  const candidateModels = Array.from(new Set([configuredModel, ...OPENROUTER_FALLBACK_MODELS]));
+
   const prompt = buildPrompt(details, lang);
 
-  // Note: response_format is NOT included — most free models don't support it.
-  // The prompt explicitly asks for JSON-only output.
-  const requestBody = {
-    model: modelName,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: prompt },
-          { type: "image_url", image_url: { url: images[0] } },
-        ],
-      },
-    ],
-  };
+  let lastError: Error | null = null;
 
-  const maxRetries = 2;
-  const backoffDelays = [2000, 5000];
+  for (const modelName of candidateModels) {
+    const requestBody = {
+      model: modelName,
+      max_tokens: 3000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            { type: "image_url", image_url: { url: images[0] } },
+          ],
+        },
+      ],
+    };
 
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
+      console.log(`[OpenRouter] Attempting analysis with model: ${modelName}`);
       const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -450,14 +455,9 @@ export async function analyzeWithOpenRouter(
       if (!res.ok) {
         const status = res.status;
         const bodyText = await res.text().catch(() => "");
-        console.error(`[OpenRouter Error] Attempt ${attempt + 1} HTTP ${status}:`, bodyText);
-
-        const isTemporary = [503, 429, 500, 502, 504].includes(status);
-        if (isTemporary && attempt < maxRetries) {
-          await new Promise((r) => setTimeout(r, backoffDelays[attempt]));
-          continue;
-        }
-        throw new Error(`OpenRouter HTTP failure status ${status}`);
+        console.warn(`[OpenRouter Warn] Model ${modelName} HTTP ${status}: ${bodyText.slice(0, 200)}`);
+        lastError = new Error(`OpenRouter ${modelName} HTTP status ${status}`);
+        continue; // Fall back to next model
       }
 
       const json = (await res.json()) as {
@@ -465,10 +465,10 @@ export async function analyzeWithOpenRouter(
         error?: { message?: string };
       };
 
-      // Surface API-level errors (e.g. model not found, credits exhausted)
       if (json.error?.message) {
-        console.error("[OpenRouter Error] API error:", json.error.message);
-        throw new Error(`OpenRouter API error: ${json.error.message}`);
+        console.warn(`[OpenRouter Warn] Model ${modelName} API error:`, json.error.message);
+        lastError = new Error(`OpenRouter ${modelName}: ${json.error.message}`);
+        continue;
       }
 
       let text = json.choices?.[0]?.message?.content ?? "";
@@ -477,8 +477,9 @@ export async function analyzeWithOpenRouter(
       }
 
       if (!text) {
-        console.error("[OpenRouter Error] Empty response content returned");
-        throw new Error("OpenRouter returned empty text");
+        console.warn(`[OpenRouter Warn] Model ${modelName} returned empty text`);
+        lastError = new Error(`OpenRouter ${modelName} returned empty text`);
+        continue;
       }
 
       text = text
@@ -489,19 +490,15 @@ export async function analyzeWithOpenRouter(
 
       const parsed = JSON.parse(text);
       const validated = validateAIResponse(parsed);
+      console.log(`[OpenRouter] Successfully analyzed with model: ${modelName}`);
       return { ...validated, provider: "OpenRouter" };
     } catch (err) {
-      console.error(`[OpenRouter Error] Attempt ${attempt + 1} exception:`, err instanceof Error ? err.message : String(err));
-      const isNetworkErr = err instanceof TypeError || (err instanceof Error && err.message.includes("fetch"));
-      if (isNetworkErr && attempt < maxRetries) {
-        await new Promise((r) => setTimeout(r, backoffDelays[attempt]));
-        continue;
-      }
-      throw err;
+      console.warn(`[OpenRouter Warn] Model ${modelName} exception:`, err instanceof Error ? err.message : String(err));
+      lastError = err instanceof Error ? err : new Error(String(err));
     }
   }
 
-  throw new Error("OpenRouter failed after retries");
+  throw lastError ?? new Error("All OpenRouter candidate models failed");
 }
 
 export const analyzeCrop = createServerFn({ method: "POST" })
