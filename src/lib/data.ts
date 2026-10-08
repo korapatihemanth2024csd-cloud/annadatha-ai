@@ -17,6 +17,7 @@ export const CROP_IMG: Record<string, string> = { paddy, tomato, banana, cotton,
 export type MarketRow = {
   crop: string; variety: string; state: string; district: string; market: string;
   min: number; max: number; modal: number; change: number;
+  arrivalDate?: string;
 };
 
 export const MARKET: MarketRow[] = [
